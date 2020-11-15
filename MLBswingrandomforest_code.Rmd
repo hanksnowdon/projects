@@ -1,0 +1,220 @@
+---
+title: "Random Forest swing prediction"
+author: "Hank Snowdon"
+date: "11/1/2020"
+mainfont: DejaVu Sans
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document: default
+font-family: Times New Roman
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Question
+
+As a side project, I was interested to find out how accurately I could predict a batter's decision to swing at or take a pitch, using pitch-level data. In this report I use 2017 pitch-level data to predict whether each pitch thrown in the 2018 season resulted in a swing or a take.
+
+## Data
+
+Pitch-level data from 2015-2018 is compiled nicely at *[https://www.kaggle.com/pschale/mlb-pitch-data-20152018](https://www.kaggle.com/pschale/mlb-pitch-data-20152018)*. Every time a pitch is thrown in Major League Baseball a vast amount of data points are collected, everything from the situation (batter, pitcher, counts, outs, runners, etc.) to the flight of the pitch (velocity, break, spin, etc.) to the result of the pitch. The result is what makes analyzing baseball data such a burgeoning field — almost any question of interest regarding the game can be answered with this data. 
+
+```{r, echo = FALSE, results = FALSE, warning= FALSE, message = FALSE}
+# Importing MLB pitch-level data using data downloaded from https://www.kaggle.com/pschale/mlb-pitch-data-20152018 
+library(tidyverse)
+pitches<- read_csv("pitches.csv")
+atbats <- read_csv("atbats.csv")
+pitches <- pitches %>% left_join(select(atbats, ab_id, g_id, p_throws, stand), by = "ab_id") %>% mutate(g_id = as.character(g_id)) %>% mutate(year = as.integer(substr(g_id, 1, 4)))
+pitches_2017 <- pitches %>% filter(year == 2017)
+pitches_2018 <- pitches %>% filter(year == 2018)
+```
+
+## Strategy
+
+To predict whether or not a batter swung at a given pitch, a wide array of variables must be considered about the pitch characteristics and the situation. With this in mind, I considered a number of different modeling methods to solve this problem. Ultimately I settled on using a random forest for a few reasons:
+
+- Random forests allow for conditionality that other methods struggle to account for. When predicting swings and non-swings, many of the variables in the provided data are not straightforward predictors. Depending on the pitcher’s handedness, the batter’s handedness and the pitch type, all the Trackman level measurements can have vastly different implications depending on the pitch. Thus, I made the decision that a random forest would be best equipped to capture these conditional probabilities.
+- This task doesn’t require model interpretation — we’re only looking for high predictive power. While techniques like logistic regression are more easily interpretable at a variable-specific level (the reason I used a logit model for problem #2), random forests are better at predicting than providing interpretable effects.
+- The data contains numerous categorical and continuous variables, and while random forests are known to favor the selection of continuous features over categorical or binary ones, they do handle both kinds quickly and require almost no pre-processing.
+- Random forests are relatively simple to tune. With the caret package in R the optimal mtry, splitting rule and minimum tree depth can be easily identified.
+
+## Data Cleaning and Manipulation
+
+### Describing and cleaning the data
+
+First we take a quick look at summary statistics for the variables included for the 2017 and 2018 data. The skim function works best since there are so many variables to consider.
+```{r, echo = F, warning=F, message=F}
+library(skimr)
+pitches_17_18 <- pitches %>% filter(year == 2017 | year == 2018)
+pitches_17_18 %>% group_by(year) %>% skim() %>% select(-c(
+  complete_rate, numeric.p0, numeric.p25, numeric.p50, numeric.p75))
+```
+
+We see some missing values for many of the variables. Normally I would try to impute those values, but looking at the data we see all the pitch-tracking variables are missing for the same observations — thus, it will be impossible to impute these values since there's nothing to predict from. Instead of imputing these observations they will just be removed from the data since they will be impossible to make predicitons with. 
+
+Looking at the variable distributions, somehow at least one observation exists for a pitch with four balls, so we will remove that impossible result as well. For the rest of our data cleaning we also remove non-normal swing situations (pitchouts, intentional balls), create a variable 'swing' that will be the variable being predicted, and make a categorical variable for count.
+
+```{r, echo = FALSE, results = FALSE, warning= FALSE, message = FALSE}
+# Eliminate pitches that aren't normal swing/non-swing situations (pitchouts, intentional balls)
+pitches_2018 <- pitches_2018 %>% mutate(nonusefultype = (code == "I" | code == "P" | code == "Q" |code == "R" )) %>% filter(nonusefultype == FALSE) %>% select(-nonusefultype)
+pitches_2017 <- pitches_2017 %>% mutate(nonusefultype = (code == "I" | code == "P" | code == "Q" |code == "R" )) %>% filter(nonusefultype == FALSE) %>% select(-nonusefultype)
+# Create swing variable in training set
+pitches_2018 <- pitches_2018 %>% mutate(swing = as.factor(as.integer(code == "S" | code == "F" | code == "T" | code == "L" | code == "W" | code == "M" | code == "X" | code == "D" | code == "E")))
+pitches_2017 <- pitches_2017 %>% mutate(swing = as.factor(as.integer(code == "S" | code == "F" | code == "T" | code == "L" | code == "W" | code == "M" | code == "X" | code == "D" | code == "E")))
+# Make count a categorical variable
+pitches_2018 <- pitches_2018 %>% unite(col = count, b_count, s_count, sep = "-")
+pitches_2017 <- pitches_2017 %>% unite(col = count, b_count, s_count, sep = "-")
+# Remove impossible counts
+pitches_2018 <-  pitches_2018 %>% filter(count != "4-2", count != "4-1", count != "4-0")
+pitches_2017 <-  pitches_2017 %>% filter(count != "4-2", count != "4-1", count != "4-0")
+# Drop NA values 
+pitches_2017 <- pitches_2017 %>% drop_na()
+pitches_2018 <- pitches_2018 %>% drop_na()
+#Pull 2018 swings for testing accuracy later, remove from 2018 pitches
+swings_2018 <- pitches_2018 %>% select(swing)
+pitches_2018 <- pitches_2018 %>% select(-swing)
+```
+
+## Splitting 2017 data into testing and training sets
+
+To avoid over-fitting the random forest model and save observations to test the model's accuracy, the 2017 data is split — 70% of observations make up the training set while 30% are saved for testing.
+
+```{r, echo = FALSE, results = FALSE, warning= FALSE, message = FALSE}
+# Split data into separate test and training sets by at bat
+library(caTools)    
+set.seed(1234)
+sample <- sample.split(pitches_2017$ab_id, SplitRatio = .7)
+train <- subset(pitches_2017, sample == TRUE)
+test  <- subset(pitches_2017, sample == FALSE)
+```
+
+### Identify highly correlated variables
+
+A correlation matrix is then constructed between numeric variables to identify features that are more than 90% correlated with another variable. These will be omitted from the modeling. Other variables that won't have predictive power for determining swing behavior are also removed, including year, game ID, etc.
+
+```{r, echo = FALSE, results = FALSE, warning= FALSE, message = FALSE}
+# Remove variables that won't have predictive power for determining swing behavior
+train <- train %>% select(-c(year, g_id, ab_id, event_num, type, code, zone, x, y))
+test <- test %>% select(-c(year, g_id, ab_id, event_num, type, code, zone, x, y))
+```
+
+```{r, echo = FALSE, results = T, warning= FALSE, message = FALSE}
+# Identity features that are more than 80% correlated with another to omit from model
+library(caret)
+set.seed(1234)
+nums <- sapply(train, is.numeric)
+data_numeric <- train[ , nums]
+data_without_na <- na.omit(data_numeric)
+cor_matrix <- cor(data_without_na)
+high_cor <- findCorrelation(cor_matrix, 0.8, names = TRUE)
+print(high_cor)
+```
+
+## Random Forest Modeling
+
+### Tuning
+
+Using the caret package, optimal hyperparameters to maximize accuracy can be determined through a five fold cross-validation tuning process. The set of parameters with the highest CV accuracy rate will be used. The parameters in the tuning grid are mtry (the number of variables that can be split at per each node), min.node.size (the minimum size of each node) and splitrule (the rule the model uses to make splitting decisions). 
+
+```{r, echo = FALSE, results = FALSE, warning= FALSE, message = FALSE}
+library(ranger)
+# Test hyperparameters through five fold cross-validation
+grid <-  expand.grid(mtry = c(4,5,6,7), min.node.size = 1, splitrule = c("gini", "extratrees"))
+fitControl <- trainControl(method = "CV",
+                           number = 5,
+                           verboseIter = TRUE)
+fit <-  train(
+  x = (train %>% select(px, pz, end_speed, spin_rate, spin_dir, break_length, break_y, ay, sz_bot, sz_top, type_confidence, vz0, x0, y0, z0, pfx_x, pfx_z, nasty, pitch_type, b_score, count, outs, pitch_num, on_1b, on_2b, on_3b, p_throws, stand)),
+  y = as.factor(train$swing),
+  method = 'ranger',
+  num.trees = 200, #200 folds is specified due to lack of computing power and quickly diminishing increases in accuracy after 100 trees
+  tuneGrid = grid,
+  trControl = fitControl, 
+  respect.unordered.factors = TRUE,
+  seed = 1234
+)
+print(fit)
+
+# Optimal fit is mtry = 7, splitrule = gini, at accuracy = 0.8298087
+
+```
+
+The optimal parameters are **mtry = 7, splitrule = 'gini' and min.node.size = 1** — they have a predictive CV accuracy of **83.1%**. 
+
+### Final specification
+
+Now, with these hyperparameters, the final random forest specification is set. Once created, its performance is verified on the previously separated testing set to be certain the results are consistent. 
+
+```{r, echo = FALSE, results = T, warning= FALSE, message = FALSE}
+library(ranger)
+# Run final model with these parameters
+modelfinal <- ranger(
+  formula = swing ~ px + pz + end_speed + spin_rate + spin_dir + break_length + break_y + ay + sz_bot + sz_top + type_confidence + vz0 + x0 + y0 + z0 + pfx_x + pfx_z + nasty + pitch_type + b_score + count + outs + pitch_num + on_1b + on_2b + on_3b + p_throws + stand, 
+  data = train, 
+  num.trees = 200, 
+  mtry = 7, 
+  min.node.size = 1,
+  splitrule = "gini", 
+  respect.unordered.factors = TRUE, 
+  seed = 1234)
+  
+# Test model accuracy on separated test set
+predicts <- predict(modelfinal, data = test)
+cf<- table(test$swing, predicts$predictions)
+print(cf)
+# 0.8357656 accuracy on the test set
+```
+The model achieves **83.6%** accuracy on the testing set. 
+
+### Final results
+
+Finally, the swing predictions for 2018 can be made using our created random forest model, and are evaluated against the correct 2018 values. 
+
+```{r, echo = FALSE, results = T, warning= FALSE, message = FALSE}
+# Make final predictions
+final_predicts <- predict(modelfinal, data = pitches_2018)
+pitches_2018_full <- cbind(pitches_2018, swings_2018) 
+cf2<- table(pitches_2018_full$swing, final_predicts$predictions)
+print(cf2)
+```
+Ultimately the model correctly predicts **81.3%** of swing decisions on 2018 pitches. 
+
+
+These predictions can be visualized on a plot with an average strike zone overlay for the first 1000 pitches of the 2018 season:
+
+```{r, echo = F, results = T, warning = F, message=F}
+dt <- cbind(pitches_2018, final_predicts$predictions) %>% head(1000)
+dt$p_throws <- factor(dt$p_throws, levels = c("L", "R"), 
+                  labels = c("LHP", "RHP"))
+dt$`final_predicts$predictions` <- factor(dt$`final_predicts$predictions`, levels = c(0, 1), 
+                  labels = c("Swing", "Take"))
+
+
+strikex <- c(-.95,.95,.95,-.95,-.95)
+strikez <- c(1.6,1.6,3.5,3.5,1.6)
+zone <- data.frame(strikex,strikez)
+
+ggplot() + geom_point(data = dt, mapping = aes(x = px, y = pz, color = `final_predicts$predictions`)) + scale_size(range = c(-1.0,2.5)) +  facet_grid(. ~ p_throws) + geom_path(data = zone, aes(x=strikex, y=strikez)) + coord_equal() + labs(
+       color = "Decision Prediction",
+       title = "2018 Swing Chart ") +
+       ylab("Feet from ground") +
+       xlab("Feet from center of plate") +   theme(panel.background = element_rect(fill = "white")) + theme(panel.grid.major.y = element_line(color = "#bad0d0", size = .4)) +
+  theme(panel.grid.major.x = element_line(color = "#bdd0d0", size = .4)) 
+```
+
+## Next Steps
+
+In terms of next steps for this research, numerous other steps could be taken to further analyze swings and takes: 
+
+* Creating variables to incorporate the previous pitch's information. 
+
+* Incorporating minor league data to see how swing decisions change across levels / if promotions affect swing decisions.
+
+* A different model type with more interpretable results could be utilized in order to determine the sign and significance of different variables on a player's decision to swing. 
+
+* Splitting this research into chases / swings in the zone is also a logical next step that requires future work. 
+
+Overall this research only scratches the surface of swing decisisons, but shows how simple modeling techniques can fairly accurately predict pitch outcomes. 
